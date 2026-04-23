@@ -132,8 +132,19 @@ Instructions:
 
     context_parts = []
     for item in page_content_list:
-        page_num = item.get("page", "?")
-        content = item.get("content", "").strip()
+        # 1. If it's a dictionary, extract safely
+        if isinstance(item, dict):
+            page_num = str(item.get("page", "?"))
+            content = str(item.get("content", item.get("text", ""))).strip()
+        # 2. If it's a plain string, just use it directly
+        elif isinstance(item, str):
+            page_num = "?"
+            content = item.strip()
+        # 3. Skip unexpected data types
+        else:
+            continue
+            
+        # 4. Add to the context block if there's actual text
         if content:
             context_parts.append(f"[Page {page_num}]\n{content}")
 
