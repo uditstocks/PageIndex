@@ -7,7 +7,7 @@ from pathlib import Path
 
 import PyPDF2
 
-from .page_index import page_index
+from .page_index import page_index, generate_doc_description
 from .page_index_md import md_to_tree
 from .retrieve import get_document, get_document_structure, get_page_content
 from .utils import ConfigLoader, remove_fields
@@ -32,7 +32,7 @@ class PageIndexClient:
 
     For agent-based QA, see examples/agentic_vectorless_rag_demo.py.
     """
-    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, workspace: str = None):
+    def __init__(self, api_key: str = None, model: str = None, retrieve_model: str = None, embedding_model: str = None, workspace: str = None):
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
         elif not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
@@ -46,6 +46,8 @@ class PageIndexClient:
         opt = ConfigLoader().load(overrides or None)
         self.model = opt.model
         self.retrieve_model = _normalize_retrieve_model(opt.retrieve_model or self.model)
+        self.embedding_model = embedding_model or getattr(opt, 'embedding_model', None)
+
         if self.workspace:
             self.workspace.mkdir(parents=True, exist_ok=True)
         self.documents = {}
@@ -67,14 +69,15 @@ class PageIndexClient:
         is_md = ext in ['.md', '.markdown']
 
         if mode == "pdf" or (mode == "auto" and is_pdf):
+            # For PDFs, PageIndex already generates doc_description
             print(f"Indexing PDF: {file_path}")
             result = page_index(
                 doc=file_path,
-                model=self.model,
                 if_add_node_summary='yes',
                 if_add_node_text='yes',
                 if_add_node_id='yes',
-                if_add_doc_description='yes'
+                if_add_doc_description='yes',
+                model=self.model
             )
             # Extract per-page text so queries don't need the original PDF
             pages = []
@@ -92,6 +95,7 @@ class PageIndexClient:
                 'page_count': len(pages),
                 'structure': result['structure'],
                 'pages': pages,
+                'doc_description_embedding': None, # Will be filled below
             }
 
         elif mode == "md" or (mode == "auto" and is_md):
@@ -101,7 +105,7 @@ class PageIndexClient:
                 if_thinning=False,
                 if_add_node_summary='yes',
                 summary_token_threshold=200,
-                model=self.model,
+                model=self.model, # Ensure model is passed
                 if_add_doc_description='yes',
                 if_add_node_text='yes',
                 if_add_node_id='yes'
@@ -120,9 +124,16 @@ class PageIndexClient:
                 'doc_description': result.get('doc_description', ''),
                 'line_count': result.get('line_count', 0),
                 'structure': result['structure'],
+                'doc_description_embedding': None, # Will be filled below
             }
         else:
             raise ValueError(f"Unsupported file format for: {file_path}")
+
+        # Generate embedding for the document description
+        if self.documents[doc_id].get('doc_description') and self.embedding_model:
+            print(f"⏳ Generating embedding for '{self.documents[doc_id]['doc_name']}' description...")
+            embedding = asyncio.run(self._generate_embedding(self.documents[doc_id]['doc_description']))
+            self.documents[doc_id]['doc_description_embedding'] = embedding
 
         print(f"Indexing complete. Document ID: {doc_id}")
         if self.workspace:
@@ -136,6 +147,7 @@ class PageIndexClient:
             'type': doc.get('type', ''),
             'doc_name': doc.get('doc_name', ''),
             'doc_description': doc.get('doc_description', ''),
+            'doc_description_embedding': doc.get('doc_description_embedding'), # Store embedding in meta
             'path': doc.get('path', ''),
         }
         if doc.get('type') == 'pdf':
@@ -200,6 +212,10 @@ class PageIndexClient:
             if meta:
                 print(f"Loaded {len(meta)} document(s) from workspace (legacy mode).")
         for doc_id, entry in meta.items():
+            # Ensure embedding is loaded if present
+            if 'doc_description_embedding' not in entry:
+                entry['doc_description_embedding'] = None
+
             doc = dict(entry, id=doc_id)
             if doc.get('path') and not os.path.isabs(doc['path']):
                 doc['path'] = str((self.workspace / doc['path']).resolve())
@@ -232,3 +248,10 @@ class PageIndexClient:
         if self.workspace:
             self._ensure_doc_loaded(doc_id)
         return get_page_content(self.documents, doc_id, pages)
+
+    async def _generate_embedding(self, text: str) -> list[float]:
+        """Internal method to generate embedding using the configured model."""
+        from .utils import llm_aembed
+        if not self.embedding_model:
+            raise ValueError("Embedding model not configured for PageIndexClient.")
+        return await llm_aembed(self.embedding_model, text)

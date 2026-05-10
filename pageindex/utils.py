@@ -7,6 +7,7 @@ import time
 import json
 import PyPDF2
 import copy
+import re
 import asyncio
 import pymupdf
 from io import BytesIO
@@ -57,6 +58,23 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                     return "", "error"
                 return ""
 
+
+_LOCAL_EMBEDDER = None
+
+async def llm_aembed(model, text, **kwargs):
+    """Generate embeddings using a local HuggingFace model via langchain-huggingface."""
+    global _LOCAL_EMBEDDER
+    try:
+        if _LOCAL_EMBEDDER is None:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            _LOCAL_EMBEDDER = HuggingFaceEmbeddings(model_name=model)
+        
+        # langchain-huggingface embeddings are synchronous; run in executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _LOCAL_EMBEDDER.embed_query, text)
+    except Exception as e:
+        logging.error(f"Error generating local embedding with {model}: {e}")
+        return []
 
 
 async def llm_acompletion(model, prompt):
@@ -128,6 +146,41 @@ def extract_json(content):
     except Exception as e:
         logging.error(f"Unexpected error while extracting JSON: {e}")
         return {}
+
+def chunk_text_by_tokens(text, model, max_tokens_per_chunk):
+    if not text:
+        return []
+    
+    # Estimate prompt overhead (initial prompt + JSON structure examples)
+    PROMPT_OVERHEAD_TOKENS = 500 
+    effective_max_tokens = max_tokens_per_chunk - PROMPT_OVERHEAD_TOKENS
+    if effective_max_tokens <= 0:
+        effective_max_tokens = max_tokens_per_chunk // 2 # Fallback if overhead is too high
+
+    tokens_in_full_text = litellm.token_counter(model=model, text=text)
+    if tokens_in_full_text <= effective_max_tokens:
+        return [text]
+
+    chunks = []
+    current_chunk_lines = []
+    current_chunk_tokens = 0
+    
+    lines = text.split('\n')
+    for line in lines:
+        line_tokens = litellm.token_counter(model=model, text=line + '\n') # Account for newline token
+        
+        if current_chunk_tokens + line_tokens > effective_max_tokens and current_chunk_lines:
+            chunks.append('\n'.join(current_chunk_lines))
+            current_chunk_lines = []
+            current_chunk_tokens = 0
+        
+        current_chunk_lines.append(line)
+        current_chunk_tokens += line_tokens
+        
+    if current_chunk_lines:
+        chunks.append('\n'.join(current_chunk_lines))
+        
+    return chunks
 
 def write_node_id(data, node_id=0):
     if isinstance(data, dict):
@@ -707,4 +760,3 @@ def print_tree(tree, indent=0):
 def print_wrapped(text, width=100):
     for line in text.splitlines():
         print(textwrap.fill(line, width=width))
-
