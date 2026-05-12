@@ -41,13 +41,13 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # local embeddings fo
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-# litellm ko batao NVIDIA endpoint use karo
+# telling litellm to use NVIDIA endpoint
 console = Console()
 
 os.environ["OPENAI_API_KEY"]  = NVIDIA_API_KEY   # PageIndex internally reads this
 os.environ["OPENAI_BASE_URL"] = NVIDIA_BASE_URL  # redirect to NVIDIA NIM
 
-# ─── Workspace — same folder as this script (PageIndex/) ──────────────────────
+# ─── Workspace - same folder as this script (PageIndex/) ──────────────────────
 WORKSPACE = Path(__file__).parent / "workspace"
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
@@ -337,7 +337,7 @@ def generate_answer(query: str, context: str, history: list = None) -> str:
     system = """You are a precise, intelligent document assistant.
 
 You are given relevant pages from a document retrieved by PageIndex 
-(vectorless, tree-based reasoning — no semantic similarity).
+(vectorless, tree-based reasoning - no semantic similarity).
 
 Rules:
 - Answer ONLY from the provided context. Never hallucinate.
