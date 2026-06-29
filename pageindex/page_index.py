@@ -535,7 +535,14 @@ def extract_matching_page_pairs(toc_page, toc_physical_index, start_page_index):
         for page_item in toc_page:
             if phy_item.get('title') == page_item.get('title'):
                 physical_index = phy_item.get('physical_index')
-                if physical_index is not None and int(physical_index) >= start_page_index:
+                # physical_index comes straight from an LLM and may be None or a
+                # non-numeric string (e.g. "Not Found in Provided Pages"). Coerce
+                # safely and skip anything that isn't a real page index.
+                try:
+                    physical_index = int(physical_index)
+                except (TypeError, ValueError):
+                    continue
+                if physical_index >= start_page_index:
                     pairs.append({
                         'title': phy_item.get('title'),
                         'page': page_item.get('page'),
@@ -567,11 +574,17 @@ def calculate_page_offset(pairs):
     return most_common
 
 def add_page_offset_to_toc_json(data, offset):
+    # offset is None when no TOC↔physical-page pairs could be matched; we can't
+    # align page numbers to physical pages, so leave the data untouched and let
+    # the caller fall back to another strategy (no-page-number / no-toc) rather
+    # than crashing on `page + None`.
+    if offset is None:
+        return data
     for i in range(len(data)):
         if data[i].get('page') is not None and isinstance(data[i]['page'], int):
             data[i]['physical_index'] = data[i]['page'] + offset
             del data[i]['page']
-    
+
     return data
 
 
@@ -1132,7 +1145,7 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
     accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
         
     logger.info({
-        'mode': 'process_toc_with_page_numbers',
+        'mode': mode,
         'accuracy': accuracy,
         'incorrect_results': incorrect_results
     })
@@ -1147,7 +1160,17 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         elif mode == 'process_toc_no_page_numbers':
             return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
         else:
-            raise Exception('Processing failed')
+            # We're already in the last-resort process_no_toc mode and accuracy is
+            # below threshold (common with smaller/instruction-divergent models).
+            # Rather than discarding the whole document, salvage what we can and
+            # return a best-effort structure so the document still indexes and is
+            # queryable. Downstream filtering keeps only the valid nodes.
+            if incorrect_results:
+                toc_with_page_number, _ = await fix_incorrect_toc_with_retries(
+                    toc_with_page_number, page_list, incorrect_results,
+                    start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
+            logger.info(f'process_no_toc accuracy {accuracy:.2f} below threshold; returning best-effort structure')
+            return toc_with_page_number
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):

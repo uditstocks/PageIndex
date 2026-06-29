@@ -1,5 +1,16 @@
+# ─── PageIndex core (PDF/Markdown → tree indexing) ───────────────────────────
 litellm==1.83.0
 pymupdf==1.26.4
 PyPDF2==3.0.1
 python-dotenv==1.1.0
 pyyaml==6.0.2
+
+# ─── RAGG.py interactive app ─────────────────────────────────────────────────
+numpy>=1.26,<3            # cosine-similarity math in the document "librarian"
+rich==13.9.4             # terminal UI (console, tables, panels, progress)
+
+# ─── Local embeddings for document pre-filtering ─────────────────────────────
+# langchain-huggingface wraps sentence-transformers (which pulls in torch +
+# transformers) to run all-MiniLM-L6-v2 locally — no external embedding API.
+langchain-huggingface==1.1.0
+sentence-transformers==5.1.2

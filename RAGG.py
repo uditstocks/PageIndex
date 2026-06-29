@@ -32,9 +32,14 @@ if not NVIDIA_API_KEY:
     print("❌ NVIDIA_API_KEY not found! Add it to your .env file.")
     sys.exit(1)
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    print("❌ OPENROUTER_API_KEY not found! Add it to your .env file.")
+    sys.exit(1)
+
 # ─── Model Config ──────────────────────────────────────────────────────────────
 # NVIDIA NIM via litellm — openai/ prefix tells litellm to use OpenAI-compatible endpoint
-INDEXING_MODEL  = "nvidia_nim/nvidia/llama-3.3-nemotron-super-49b-v1"   # builds the tree
+INDEXING_MODEL  = "nvidia_nim/nvidia/llama-3.3-nemotron-super-49b-v1"      # builds the tree via OpenRouter
 RETRIEVAL_MODEL = "nvidia_nim/nvidia/llama-3.3-nemotron-super-49b-v1"   # navigates tree to find pages
 ANSWER_MODEL    = "nvidia_nim/nvidia/llama-3.3-nemotron-super-49b-v1"   # generates final answer
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2" # local embeddings for document selection
@@ -46,6 +51,13 @@ console = Console()
 
 os.environ["OPENAI_API_KEY"]  = NVIDIA_API_KEY   # PageIndex internally reads this
 os.environ["OPENAI_BASE_URL"] = NVIDIA_BASE_URL  # redirect to NVIDIA NIM
+# The indexing path runs through PageIndex's litellm wrappers, which call the
+# `nvidia_nim/` provider WITHOUT passing an explicit api_key. litellm resolves
+# that provider's key from NVIDIA_NIM_API_KEY, so set it explicitly here —
+# otherwise indexing only authenticates via an undocumented OPENAI_API_KEY
+# fallback that can break on a litellm upgrade.
+os.environ["NVIDIA_NIM_API_KEY"] = NVIDIA_API_KEY
+os.environ["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
 
 # ─── Workspace - same folder as this script (PageIndex/) ──────────────────────
 WORKSPACE = Path(__file__).parent / "workspace"
@@ -64,7 +76,7 @@ except ImportError:
 # ─── Step 1: Index PDF → Build Semantic Tree ───────────────────────────────────
 def initialize_client() -> PageIndexClient:
     client = PageIndexClient(
-        api_key=NVIDIA_API_KEY,
+        api_key=OPENROUTER_API_KEY,
         model=INDEXING_MODEL,
         retrieve_model=RETRIEVAL_MODEL,
         embedding_model=EMBEDDING_MODEL, # Pass embedding model to client
@@ -104,19 +116,22 @@ async def select_relevant_documents(client: PageIndexClient, query: str) -> list
         return await _llm_select_documents_fallback(client, query)
 
     document_scores = []
+    q_norm = np.linalg.norm(query_embedding)  # constant across docs — compute once
     for doc_id, info in client.documents.items():
         doc_embedding = info.get('doc_description_embedding')
         if doc_embedding:
             doc_embedding = np.array(doc_embedding)
-            # Calculate cosine similarity
-            q_norm = np.linalg.norm(query_embedding)
             d_norm = np.linalg.norm(doc_embedding)
-            
             if q_norm > 0 and d_norm > 0:
-                similarity = np.dot(query_embedding, doc_embedding) / (q_norm * d_norm)
-                document_scores.append((similarity, doc_id, info.get('doc_name'), info.get('doc_description')))
+                similarity = float(np.dot(query_embedding, doc_embedding) / (q_norm * d_norm))
             else:
-                document_scores.append((0.0, doc_id, info.get('doc_name'), info.get('doc_description')))
+                similarity = 0.0
+        else:
+            # Legacy / embedding-less doc: keep it as a candidate at a neutral
+            # score so it can still survive into the LLM refinement step instead
+            # of being silently invisible to retrieval forever.
+            similarity = 0.0
+        document_scores.append((similarity, doc_id, info.get('doc_name'), info.get('doc_description')))
 
     # Sort by similarity and pick top N (e.g., 5)
     document_scores.sort(key=lambda x: x[0], reverse=True)
@@ -221,16 +236,64 @@ Instructions:
 
 
 # ─── Step 2: Retrieve Relevant Pages via Tree Search ──────────────────────────
+def _collect_line_nums(structure) -> list[int]:
+    """Collect every node's line_num from a (possibly nested) tree structure."""
+    line_nums = []
+    if isinstance(structure, list):
+        for node in structure:
+            line_nums.extend(_collect_line_nums(node))
+    elif isinstance(structure, dict):
+        if isinstance(structure.get("line_num"), int):
+            line_nums.append(structure["line_num"])
+        line_nums.extend(_collect_line_nums(structure.get("nodes", [])))
+    return line_nums
+
+
 def retrieve_pages(client: PageIndexClient, doc_id: str, query: str, progress: Progress = None) -> str:
-    console.print(f"🔍 [dim]Retrieving relevant pages for: '{query}'[/dim]")
+    console.print(f"🔍 [dim]Retrieving relevant context for: '{query}'[/dim]")
 
     docs = client.documents
     client._ensure_doc_loaded(doc_id)
-    doc_structure = get_document_structure(docs, doc_id)
+    doc_structure = json.loads(get_document_structure(docs, doc_id))
 
     tree_str = json.dumps(doc_structure, indent=2)
 
-    prompt = f"""You are a precise document navigator.
+    # Markdown documents are addressed by line numbers (each node's `line_num`),
+    # while PDFs are addressed by physical page numbers. get_page_content
+    # interprets the range it receives accordingly, so the navigator prompt must
+    # ask for the right unit — otherwise (for Markdown) the model returns small
+    # "page" numbers that match no node line_num and retrieval comes back empty.
+    doc_type = client.documents[doc_id].get('type', 'pdf')
+
+    if doc_type == 'md':
+        unit = "lines"
+        loc_label = "Line"
+        line_nums = sorted(set(_collect_line_nums(doc_structure)))
+        if line_nums:
+            default_end = line_nums[1] if len(line_nums) > 1 else line_nums[0] + 50
+            default_pages = f"{line_nums[0]}-{default_end}"
+        else:
+            default_pages = "1-50"
+        prompt = f"""You are a precise document navigator.
+Given this Markdown document's hierarchical tree structure, identify the line range(s) most relevant to answering the question.
+Each node has a "line_num" field — the source line where that section begins.
+
+Document Structure (tree index):
+{tree_str}
+
+Question: {query}
+
+Instructions:
+1. Look at the titles, summaries, and line_num values in the tree.
+2. Identify the most relevant section(s).
+3. Return a range that starts at the chosen section's line_num and ends at (or just before) the NEXT section's line_num, so the whole section body is included.
+4. Return ONLY a JSON object like: {{"pages": "120-180", "reasoning": "section 2.1 at line 120 covers X..."}} where the numbers are line_num values copied from the tree.
+5. Return ONLY the JSON, nothing else."""
+    else:
+        unit = "pages"
+        loc_label = "Page"
+        default_pages = "1-3"
+        prompt = f"""You are a precise document navigator.
 Given this document's hierarchical tree structure, identify the page range(s) most relevant to answering the question.
 
 Document Structure (tree index):
@@ -258,8 +321,9 @@ Instructions:
 
     raw = response.choices[0].message.content.strip()
 
-    # Parse page range
-    pages_str = "1-2" # default
+    # Parse the requested range (defaults are type-aware: page numbers for PDF,
+    # line numbers for Markdown).
+    pages_str = default_pages
     reasoning = "No reasoning provided."
 
     try:
@@ -268,17 +332,17 @@ Instructions:
             if raw.startswith("json"):
                 raw = raw[4:]
         result = json.loads(raw.strip())
-        pages_str = result.get("pages", "1-3")
+        pages_str = str(result.get("pages", default_pages))
         reasoning = result.get("reasoning", reasoning)
     except Exception:
         match = re.search(r'"pages"\s*:\s*"([^"]+)"', raw)
-        pages_str = match.group(1) if match else "1-3"
+        pages_str = match.group(1) if match else default_pages
 
     doc_name = client.documents[doc_id].get('doc_name', 'Doc')
 
     # ─── Human in the Loop: Navigator Plan ──────────────────────────────────
     console.print(Panel(
-        f"[bold yellow]Reason:[/bold yellow] {reasoning}\n[bold yellow]Target:[/bold yellow] Pages {pages_str}",
+        f"[bold yellow]Reason:[/bold yellow] {reasoning}\n[bold yellow]Target:[/bold yellow] {unit.capitalize()} {pages_str}",
         title=f"🗺️  Navigation Plan: {doc_name}", border_style="yellow"
     ))
     user_input = console.input(f"   [bold green]✅ Proceed?[/bold green] [Enter for Yes / Type range / 's' to skip]: ").strip()
@@ -290,7 +354,8 @@ Instructions:
         pages_str = user_input
         console.print(f"   🛠️  [italic]Manual override: Using pages {pages_str}[/italic]")
 
-    # CRITICAL FIX: get_page_content returns a JSON string, must parse it.
+    # get_page_content always returns a JSON string: either a list of
+    # {'page', 'content'} items or an {'error': ...} object. Parse it.
     page_content_raw = get_page_content(docs, doc_id, pages_str)
     try:
         page_content_list = json.loads(page_content_raw)
@@ -298,8 +363,16 @@ Instructions:
             console.print(f"[red]❌ Retrieval error: {page_content_list['error']}[/red]")
             return ""
     except json.JSONDecodeError:
-        # Handle case where it might already be a list or direct text
+        # Defensive: the client contract guarantees JSON, so this only fires on
+        # a contract violation. Treat it as "no content".
         page_content_list = []
+
+    if not page_content_list:
+        console.print(
+            f"[yellow]⚠️  No content found for {doc_name} (requested {unit}: {pages_str}). "
+            f"This document will contribute nothing — the {unit} may not exist or have no extractable text.[/yellow]"
+        )
+        return ""
 
     # Create local progress display only during the reading phase to avoid conflict with console.input
     with Progress(
@@ -324,7 +397,7 @@ Instructions:
                 continue
                 
             if content:
-                context_parts.append(f"[Source: {doc_name}, Page {page_num}]\n{content}")
+                context_parts.append(f"[Source: {doc_name}, {loc_label} {page_num}]\n{content}")
                 
             progress_bar.advance(retrieval_task)
             time.sleep(0.05)
@@ -333,28 +406,31 @@ Instructions:
 
 
 # ─── Step 3: Generate Answer ───────────────────────────────────────────────────
-def generate_answer(query: str, context: str, history: list = None) -> str:
+def generate_answer(query: str, context: str) -> str:
     system = """You are a precise, intelligent document assistant.
 
 You are given relevant pages from a document retrieved by PageIndex 
-(vectorless, tree-based reasoning - no semantic similarity).
+(vectorless, tree-based reasoning — no semantic similarity).
 
 Rules:
-- Answer ONLY from the provided context. Never hallucinate.
+- Answer ONLY from the provided context below. Never hallucinate.
 - If the answer isn't in the context, say: "This information isn't in the retrieved pages."
 - Be concise and structured. Use bullet points where helpful.
 - Reference the Document Name and page numbers when citing specific facts."""
 
-    messages = [{"role": "system", "content": system}]
-    if history:
-        messages.extend(history)
-
-    messages.append({"role": "user", "content": f"""Retrieved document pages:
+    # The answer is grounded SOLELY on the freshly retrieved context. Prior
+    # conversation turns are intentionally NOT replayed here: doing so let the
+    # model restate facts from earlier turns/documents that are no longer in
+    # context, breaking the "answer only from the provided context" guarantee.
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"""Retrieved document pages:
 ---
 {context}
 ---
 
-Question: {query}"""})
+Question: {query}"""},
+    ]
 
     with console.status("[bold green]Generating final answer...", spinner="point"):
         response = litellm.completion(
@@ -384,13 +460,19 @@ def run_session(pdf_files: list[str]):
         all_doc_ids.append(did)
 
     indexed_names = [info.get('doc_name') for info in client.documents.values()]
-    
+
+    # Don't drop the user into an interactive loop that can never succeed.
+    if not client.documents:
+        console.print(
+            "[yellow]⚠️  No documents are indexed. Drop PDF/Markdown files into the "
+            "'documents/' folder and re-run.[/yellow]\n"
+        )
+        return
+
     console.print(f"\n🤖 [bold]Model:[/bold] [dim]{INDEXING_MODEL}[/dim]")
     console.print(f"📚 [bold]Library:[/bold] {len(indexed_names)} documents loaded.")
     console.print("\n[bold cyan]🎯 Ready![/bold cyan] Ask a question across the library.")
     console.print("[dim]Commands: 'exit' to quit | 'info' to see doc list[/dim]\n")
-
-    history = []
 
     while True:
         try:
@@ -446,17 +528,20 @@ def run_session(pdf_files: list[str]):
             
             aggregated_context = "\n\n=== NEXT DOCUMENT ===\n\n".join(full_context_parts)
 
+            # Nothing was retrieved (all docs skipped, retrieval errored, or the
+            # selected pages had no extractable text). Skip the answer call so we
+            # don't pay for an LLM round-trip that can only produce an ungrounded
+            # response.
+            if not aggregated_context.strip():
+                console.print("[yellow]🤷 No content was retrieved for this query — nothing to answer.[/yellow]\n")
+                continue
+
             # Answer Step
-            answer = generate_answer(query, aggregated_context, history)
+            answer = generate_answer(query, aggregated_context)
             console.print(Rule(style="dim"))
             console.print(f"[bold blue]🤖 Assistant:[/bold blue]")
             console.print(Markdown(answer))
             console.print(Rule(style="dim"))
-
-            history.append({"role": "user", "content": query})
-            history.append({"role": "assistant", "content": answer})
-            if len(history) > 12:
-                history = history[-12:]
 
         except Exception as e:
             print(f"❌ Error: {e}\n")

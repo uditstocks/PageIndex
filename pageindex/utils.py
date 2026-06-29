@@ -115,34 +115,43 @@ def get_json_content(response):
          
 
 def extract_json(content):
+    if not content or not isinstance(content, str):
+        return {}
     try:
-        # First, try to extract JSON enclosed within ```json and ```
+        # First, prefer JSON enclosed within a ```json ... ``` fence if present.
         start_idx = content.find("```json")
         if start_idx != -1:
             start_idx += 7  # Adjust index to start after the delimiter
-            end_idx = content.rfind("```")
-            json_content = content[start_idx:end_idx].strip()
+            end_idx = content.find("```", start_idx)
+            json_content = content[start_idx:end_idx] if end_idx != -1 else content[start_idx:]
         else:
-            # If no delimiters, assume entire content could be JSON
-            json_content = content.strip()
+            # If no delimiters, assume the content contains JSON somewhere.
+            json_content = content
 
-        # Clean up common issues that might cause parsing errors
-        json_content = json_content.replace('None', 'null')  # Replace Python None with JSON null
-        json_content = json_content.replace('\n', ' ').replace('\r', ' ')  # Remove newlines
-        json_content = ' '.join(json_content.split())  # Normalize whitespace
+        json_content = json_content.replace('None', 'null').strip()
 
-        # Attempt to parse and return the JSON object
-        return json.loads(json_content)
+        # Trim leading prose ("Here is the JSON:") by starting at the first
+        # opening brace/bracket so the value parses cleanly.
+        candidates = [i for i in (json_content.find('{'), json_content.find('[')) if i != -1]
+        if candidates:
+            json_content = json_content[min(candidates):]
+
+        # raw_decode parses the FIRST valid JSON value and ignores anything the
+        # model appended after it (the common "Extra data: ..." failure).
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(json_content)
+            return obj
+        except json.JSONDecodeError:
+            # Fall back to a whitespace-normalized parse (handles raw newlines
+            # inside string values) plus trailing-comma cleanup.
+            normalized = ' '.join(json_content.split())
+            try:
+                return json.loads(normalized)
+            except json.JSONDecodeError:
+                return json.loads(normalized.replace(',]', ']').replace(',}', '}'))
     except json.JSONDecodeError as e:
         logging.error(f"Failed to extract JSON: {e}")
-        # Try to clean up the content further if initial parsing fails
-        try:
-            # Remove any trailing commas before closing brackets/braces
-            json_content = json_content.replace(',]', ']').replace(',}', '}')
-            return json.loads(json_content)
-        except:
-            logging.error("Failed to parse JSON even after cleanup")
-            return {}
+        return {}
     except Exception as e:
         logging.error(f"Unexpected error while extracting JSON: {e}")
         return {}
