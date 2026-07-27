@@ -232,7 +232,7 @@ Because it is a coroutine, call it with `asyncio.run(md_to_tree(...))` (or
 
 ---
 
-## `run_pageindex.py` CLI
+## `run_pageindex.py` (CLI)
 
 [`../run_pageindex.py`](../run_pageindex.py) is a standalone tool that indexes
 **one** file and dumps its tree to `results/<name>_structure.json`. Exactly one
