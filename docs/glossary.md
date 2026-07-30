@@ -42,7 +42,7 @@ Two distinctions are easy to blur and worth stating plainly:
 
 ## See also
 
-- [./research-background.md](./research-background.md) — the concepts and motivation behind vectorless retrieval and reasoning over structure
-- [./architecture.md](./architecture.md) — how the Librarian, Navigator, Reader, and Generator fit together
-- [./methodology.md](./methodology.md) — how PageIndex builds the tree and how `verify_toc` works
-- [./README.md](./README.md) — the documentation index
+- [./research-background.md](./research-background.md) the concepts and motivation behind vectorless retrieval and reasoning over structure
+- [./architecture.md](./architecture.md) - how the Librarian, Navigator, Reader, and Generator fit together
+- [./methodology.md](./methodology.md) - how PageIndex builds the tree and how `verify_toc` works
+- [./README.md](./README.md) - the documentation index
