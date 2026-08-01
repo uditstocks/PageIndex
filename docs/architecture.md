@@ -8,8 +8,8 @@ VectorlessRAG retrieves *without* a vector database. Each document is parsed int
 
 The system has two phases that are cleanly separated:
 
-- **Offline indexing** — run *once per document*. The PageIndex engine parses a PDF or Markdown file into a hierarchical tree (JSON) and persists it to the `workspace/` directory.
-- **Online query** — run *per question*. A four-stage pipeline (Librarian, Navigator, Reader, Generator) walks from the user's question to a cited answer.
+- **Offline indexing** - run *once per document*. The PageIndex engine parses a PDF or Markdown file into a hierarchical tree (JSON) and persists it to the `workspace/` directory.
+- **Online query** - run *per question*. A four-stage pipeline (Librarian, Navigator, Reader, Generator) walks from the user's question to a cited answer.
 
 ```mermaid
 flowchart TD
