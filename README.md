@@ -1,6 +1,6 @@
 # 📚 VectorlessRAG
 
-> RAG without a vector database — retrieval by LLM reasoning over a document's structure.
+> RAG without a vector database - retrieval by LLM reasoning over a document's structure.
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Engine: PageIndex](https://img.shields.io/badge/Engine-PageIndex-6f42c1)](./docs/architecture.md)
