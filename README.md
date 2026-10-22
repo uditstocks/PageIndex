@@ -10,7 +10,7 @@
 
 ---
 
-## What is VectorlessRAG?
+## What is Vectorless RAG?
 
 VectorlessRAG is a Retrieval-Augmented Generation system that retrieves **without a vector database**. Instead of splitting documents into chunks and embedding them for nearest-neighbour search, it parses each document into a **hierarchical tree** that mirrors its table of contents — sections and subsections with their page ranges (for PDFs) or line numbers (for Markdown), plus an LLM-written summary on every node. That indexing work is done by the **PageIndex** engine.
 
